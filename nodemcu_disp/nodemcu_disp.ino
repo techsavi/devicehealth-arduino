@@ -13,13 +13,20 @@ const char* mqttHost = MQTT_HOST;
 const uint16_t mqttPort = 1883;
 const char* mqttName = "nodemcu-disp";
 const char* mqttPassword = MQTT_PASSWORD;
-const bool showAlerts = false;  // subscribe to alerts/# and show them on the OLED
+// Whether to show alerts on the OLED while the hub's IoT Devices page leaves "Show alerts" at the
+// device's default (registry/devices/<name>; HubMqtt applies the page's setting otherwise).
+const bool showAlerts = false;
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool oledReady = false;
 HubMqtt hub(mqttHost, mqttPort, mqttName, mqttPassword);
 
 const char* LEVEL_NAMES[] = {"INFO", "WARNING", "CRITICAL"};
+
+// The hub's Identify button: the name fills the screen until then.
+unsigned long identifyStart = 0, identifyMs = 0;
+char identifyText[32], identifySubtitle[64];
+bool redrawNow = false;
 
 // Draw a 10-segment horizontal bargraph along the bottom of the display.
 void drawSignalBar(int percent) {
@@ -99,6 +106,37 @@ void drawAlert(const HubAlert& a, int index, int count) {
   printWrapped(text, 5);
 }
 
+// The name as large as fits (broken into lines if need be) above the subtitle; `inverted` flashes it.
+void drawIdentify(bool inverted) {
+  uint16_t color = inverted ? SSD1306_BLACK : SSD1306_WHITE;
+  if (inverted) display.fillScreen(SSD1306_WHITE);
+  display.setTextColor(color);
+  display.setTextWrap(false);
+
+  int len = strlen(identifyText);
+  int size = 3, cols, lines;
+  for (;; size--) {
+    cols = 128 / (6 * size);
+    lines = max(1, (len + cols - 1) / cols);
+    if (size == 1 || lines * 8 * size <= 52) break;
+  }
+  display.setTextSize(size);
+  int y = (52 - lines * 8 * size) / 2;
+  for (int i = 0; i < len; i += cols) {
+    int n = min(cols, len - i);
+    display.setCursor((128 - n * 6 * size) / 2, y);
+    display.write((const uint8_t*)identifyText + i, n);
+    y += 8 * size;
+  }
+
+  display.setTextSize(1);
+  int n = min((int)strlen(identifySubtitle), 21);
+  display.setCursor((128 - n * 6) / 2, 55);
+  display.write((const uint8_t*)identifySubtitle, n);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextWrap(true);
+}
+
 void drawStatus(bool connected, int rssi, int percent, int alertCount) {
   if (connected) {
     display.println("WiFi connected!");
@@ -147,6 +185,15 @@ void setup() {
     h["app"] = "nodemcu_disp";
     h["display"] = oledReady ? "SSD1306 128x64" : nullptr;
   });
+  if (oledReady) {
+    hub.onIdentify([](unsigned long seconds, const char* text, const char* subtitle) {
+      toDisplayText(identifyText, sizeof identifyText, text);
+      toDisplayText(identifySubtitle, sizeof identifySubtitle, subtitle);
+      identifyStart = millis();
+      identifyMs = seconds * 1000;
+      redrawNow = true;
+    });
+  }
 
   WiFi.mode(WIFI_STA);
   hub.begin();
@@ -161,11 +208,12 @@ void loop() {
   hub.loop();
 
   unsigned long now = millis();
-  if (now - lastDraw < 1000) {
+  if (now - lastDraw < 1000 && !redrawNow) {
     delay(10);
     return;
   }
   lastDraw = now;
+  redrawNow = false;
 
   bool connected = WiFi.status() == WL_CONNECTED;
   int rssi = connected ? WiFi.RSSI() : 0;
@@ -178,7 +226,9 @@ void loop() {
     display.setCursor(0, 0);
     // With alerts, the status page and each alert take turns, 4 s each.
     int page = (now / 4000) % (1 + alertCount);
-    if (page == 0) {
+    if (identifyMs && now - identifyStart < identifyMs) {
+      drawIdentify((now - identifyStart) / 1000 % 2 == 0);
+    } else if (page == 0) {
       drawStatus(connected, rssi, percent, alertCount);
     } else {
       drawAlert(*alerts[page - 1], page - 1, alertCount);

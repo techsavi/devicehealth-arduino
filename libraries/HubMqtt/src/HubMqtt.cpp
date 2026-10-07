@@ -1,9 +1,11 @@
 #include "HubMqtt.h"
 #include <time.h>
 
-const char* const AGENT_VERSION = "1.0";
+const char* const AGENT_VERSION = "1.1";
 const char* const LEVEL_NAMES[] = {"info", "warning", "critical"};
 const char* const ALL_LEVELS_FROM[] = {"manual", "tabletpanel"};
+// How long to wait for the retained registry entry after connecting before taking it as unset.
+const unsigned long REGISTRY_WAIT_MS = 3000;
 
 static uint32_t fnv1a(const char* s) {
   uint32_t h = 2166136261u;
@@ -37,6 +39,8 @@ void HubMqtt::begin() {
 
   statusTopic_ = String("status/") + name_;
   healthTopic_ = String("devices/") + name_ + "/health";
+  registryTopic_ = String("registry/devices/") + name_;
+  identifyTopic_ = String("cmd/") + name_ + "/identify";
   alertFilter_["level"] = true;
   alertFilter_["title"] = true;
   alertFilter_["message"] = true;
@@ -60,8 +64,14 @@ bool HubMqtt::connect() {
     return false;
   }
   memset(alerts_, 0, sizeof alerts_);  // the active ones arrive again (retained) on subscribing
+  alertsSubscribed_ = false;
   mqtt_.publish(statusTopic_.c_str(), "online", true);
-  if (showAlerts) mqtt_.subscribe("alerts/#");
+  // alerts/# waits for the registry entry (retained, so it comes at once if there is one), so a
+  // device set to "off" doesn't flash the alerts.
+  mqtt_.subscribe(registryTopic_.c_str());
+  registryPending_ = true;
+  registryDeadline_ = millis() + REGISTRY_WAIT_MS;
+  if (onIdentify_) mqtt_.subscribe(identifyTopic_.c_str());
   if (onConnect_) onConnect_();
   lastHealth_ = millis() - healthIntervalMs;  // report at once
   Serial.printf("MQTT: connected to %s:%u as %s\n", host_, port_, name_);
@@ -92,6 +102,11 @@ void HubMqtt::loop() {
     backoff_ = 5000;
   }
   mqtt_.loop();
+  if (registryPending_ && (long)(millis() - registryDeadline_) >= 0) {
+    registryPending_ = false;  // no registry entry
+    alertsSetting_ = ALERTS_DEFAULT;
+    applyAlertsSetting();
+  }
   if (millis() - lastHealth_ >= healthIntervalMs) {
     lastHealth_ = millis();
     publishHealth();
@@ -134,6 +149,7 @@ void HubMqtt::publishHealth() {
   w["channel"] = WiFi.channel();
   w["dbm"] = rssi;
   w["pct"] = rssiToPercent(rssi);
+  if (onIdentify_) h["commands"].add("identify");
   if (onHealth_) onHealth_(h.as<JsonObject>());
 
   mqtt_.beginPublish(healthTopic_.c_str(), measureJson(h), true);
@@ -164,11 +180,67 @@ bool HubMqtt::clearAlert(const char* id) {
 }
 
 void HubMqtt::handleMessage(char* topic, uint8_t* payload, unsigned int length) {
-  if (!strncmp(topic, "alerts/", 7)) {
+  if (registryTopic_ == topic) {
+    handleRegistry(payload, length);
+  } else if (identifyTopic_ == topic) {
+    handleIdentify(payload, length);
+  } else if (!strncmp(topic, "alerts/", 7)) {
     handleAlert(topic, payload, length);
   } else if (onMessage_) {
     onMessage_(topic, payload, length);
   }
+}
+
+// registry/devices/<name>: the hub's record of this device; "alerts" is its Show alerts setting.
+void HubMqtt::handleRegistry(const uint8_t* payload, unsigned int length) {
+  JsonDocument filter;
+  filter["alerts"] = true;
+  JsonDocument doc;
+  if (length) deserializeJson(doc, (const char*)payload, length, DeserializationOption::Filter(filter));
+  const char* value = doc["alerts"] | "";
+  alertsSetting_ = !strcmp(value, "all")        ? ALERTS_ALL
+                   : !strcmp(value, "warning")  ? ALERTS_WARNING
+                   : !strcmp(value, "critical") ? ALERTS_CRITICAL
+                   : !strcmp(value, "off")      ? ALERTS_OFF
+                                                : ALERTS_DEFAULT;
+  registryPending_ = false;
+  applyAlertsSetting();
+}
+
+// Subscribes to alerts/# or leaves it as the setting needs. The alerts already received are kept
+// whatever their level and filtered by alerts(), so a changed level shows at the next redraw.
+void HubMqtt::applyAlertsSetting() {
+  bool want = wantsAlerts();
+  if (want && !alertsSubscribed_) {
+    alertsSubscribed_ = mqtt_.subscribe("alerts/#");
+  } else if (!want && alertsSubscribed_) {
+    mqtt_.unsubscribe("alerts/#");
+    alertsSubscribed_ = false;
+    memset(alerts_, 0, sizeof alerts_);
+  }
+}
+
+bool HubMqtt::wantsAlerts() {
+  return alertsSetting_ == ALERTS_DEFAULT ? showAlerts : alertsSetting_ != ALERTS_OFF;
+}
+
+bool HubMqtt::shows(const HubAlert& a) {
+  switch (alertsSetting_) {
+    case ALERTS_ALL: return true;
+    case ALERTS_WARNING: return a.level >= HUB_WARNING;
+    case ALERTS_CRITICAL: return a.level >= HUB_CRITICAL;
+    case ALERTS_OFF: return false;
+    default: return showAlerts && (a.level >= HUB_WARNING || a.allLevels);
+  }
+}
+
+// cmd/<name>/identify {seconds, text, subtitle}, from the hub's Identify button (not retained).
+void HubMqtt::handleIdentify(const uint8_t* payload, unsigned int length) {
+  JsonDocument doc;
+  if (length) deserializeJson(doc, (const char*)payload, length);
+  unsigned long seconds = doc["seconds"] | 30;
+  const char* text = doc["text"] | "";
+  onIdentify_(min(seconds, 600UL), *text ? text : name_, doc["subtitle"] | "");
 }
 
 void HubMqtt::handleAlert(const char* topic, const uint8_t* payload, unsigned int length) {
@@ -181,6 +253,10 @@ void HubMqtt::handleAlert(const char* topic, const uint8_t* payload, unsigned in
   JsonDocument doc;
   bool ok = length > 0 &&
             !deserializeJson(doc, (const char*)payload, length, DeserializationOption::Filter(alertFilter_));
+  if (!ok) {
+    if (slot >= 0) alerts_[slot].topicHash = 0;  // cleared
+    return;
+  }
   const char* lvl = doc["level"] | "info";
   uint8_t level = !strcmp(lvl, "critical") ? HUB_CRITICAL : !strcmp(lvl, "warning") ? HUB_WARNING : HUB_INFO;
 
@@ -193,16 +269,13 @@ void HubMqtt::handleAlert(const char* topic, const uint8_t* payload, unsigned in
     if (strlen(s) == srcLen && !strncmp(src, s, srcLen)) allLevels = true;
   }
 
-  if (!ok || (level < HUB_WARNING && !allLevels)) {
-    if (slot >= 0) alerts_[slot].topicHash = 0;  // cleared, or not one to show
-    return;
-  }
   if (slot < 0) slot = freeSlot(level);
   if (slot < 0) return;  // full of more severe alerts
 
   HubAlert& a = alerts_[slot];
   a.topicHash = hash;
   a.level = level;
+  a.allLevels = allLevels;
   a.expires = doc["expires"] | 0;
   const char* title = doc["title"] | "";
   if (*title) {
@@ -233,6 +306,7 @@ int HubMqtt::alerts(const HubAlert** out) {
       a.topicHash = 0;
       continue;
     }
+    if (!shows(a)) continue;
     int j = n++;
     while (j > 0 && out[j - 1]->level < a.level) {
       out[j] = out[j - 1];
