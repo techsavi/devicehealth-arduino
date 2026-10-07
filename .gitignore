@@ -1,0 +1,6 @@
+# Installed third-party libraries (Library Manager); our own libraries are committed.
+/libraries/*
+!/libraries/HubMqtt/
+
+# Credentials; each sketch commits a secrets.example.h instead.
+secrets.h
